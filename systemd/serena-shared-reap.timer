@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodically reap idle shared serena SSE servers
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

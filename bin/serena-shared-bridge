@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# serena-shared-bridge — one serena LSP per PROJECT, shared by all agents.
+#
+# Registered as the global `serena` MCP server (stdio) in ~/.claude.json. Each
+# agent that loads serena runs this wrapper, which:
+#   1. resolves the project root from the agent's cwd,
+#   2. ensures ONE detached serena SSE server for that root (singleton, via a
+#      per-state-dir lock + a path->port registry), so the heavy language server
+#      (rust-analyzer / pyright / ...) is started ONCE per project instead of
+#      once per agent, then
+#   3. bridges the agent's stdio MCP <-> that SSE server with mcp-proxy.
+#
+# The SSE server is started detached (nohup) so it outlives individual agents
+# and is reused by the next one. Fail-open: any failure falls back to the
+# original per-agent stdio serena, so an agent never loses serena because of
+# this wrapper.
+#
+# SERENA_SHARED:
+#   unset/1  shared bridge for normal checkouts; SKIP serena (run LSP-free) in
+#            linked git worktrees — fan-out/worker-pool workers edit per a
+#            handoff and don't need symbol tools, and each worktree is a distinct
+#            path that would otherwise get its own server/LSP (the ghost class).
+#   force    always use the shared bridge, even in a worktree (interactive use).
+#   0        disable the bridge entirely; fall back to per-agent stdio serena.
+set -uo pipefail
+
+SERENA_FROM="git+https://github.com/oraios/serena"
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/serena-shared"
+PORT_LO=9100
+PORT_HI=9899
+
+log() { printf '[serena-shared-bridge] %s\n' "$*" >&2; }
+
+# Last resort: the original per-agent stdio serena. Never leave the agent
+# without serena.
+fallback() {
+  log "fallback to per-agent stdio serena ($1)"
+  exec uvx --from "$SERENA_FROM" serena start-mcp-server \
+    --project-from-cwd --context claude-code --enable-web-dashboard False
+}
+
+[ "${SERENA_SHARED:-1}" = "0" ] && fallback "SERENA_SHARED=0"
+command -v ss >/dev/null 2>&1 || fallback "no ss"
+mkdir -p "$STATE_DIR" 2>/dev/null || fallback "no state dir"
+
+listening() { ss -ltn 2>/dev/null | grep -q "[:.]$1 "; }
+
+# 1. Project root (git toplevel, else cwd).
+root="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)" || root=""
+[ -n "$root" ] || root="$(pwd -P)"
+
+# Fix 2: don't start a project language server for non-project roots:
+#  - a linked git worktree (its top-level `.git` is a FILE / gitdir pointer, not
+#    a directory) is a fan-out/ephemeral worker that edits per a handoff and
+#    doesn't need symbol tools -- and each is a distinct path that would
+#    otherwise spin its own server/LSP (the ghost-analyzer class that drove the
+#    OOM); and
+#  - $HOME itself is never a project; indexing the whole home dir is pure waste.
+# Run these LSP-free. Override with SERENA_SHARED=force.
+if [ "${SERENA_SHARED:-1}" != "force" ] && { [ -f "$root/.git" ] || [ "$root" = "$HOME" ]; }; then
+  log "no project LSP for $root (worktree or \$HOME): running serena-free (SERENA_SHARED=force to keep it)"
+  exit 0
+fi
+
+reg="$STATE_DIR/ports.tsv"
+lock="$STATE_DIR/registry.lock"
+port=""
+
+# 2+3. Assign a stable port for this root and ensure its server, under a lock so
+# concurrent agents racing on the same project don't double-start.
+exec 9>"$lock" || fallback "no lock fd"
+flock 9 || fallback "no flock"
+
+[ -f "$reg" ] && port="$(awk -F'\t' -v r="$root" '$1==r{print $2; exit}' "$reg")"
+
+if [ -z "$port" ]; then
+  used=" $( [ -f "$reg" ] && cut -f2 "$reg" | tr '\n' ' ' ) "
+  p=$PORT_LO
+  while [ "$p" -le "$PORT_HI" ]; do
+    case "$used" in *" $p "*) p=$((p + 1)); continue ;; esac
+    listening "$p" || { port="$p"; break; }
+    p=$((p + 1))
+  done
+  [ -n "$port" ] || { flock -u 9; fallback "no free port"; }
+  printf '%s\t%s\n' "$root" "$port" >>"$reg"
+fi
+
+if ! listening "$port"; then
+  log "starting serena SSE for $root on :$port"
+  nohup uvx --from "$SERENA_FROM" serena start-mcp-server \
+    --transport sse --project "$root" --context claude-code \
+    --host 127.0.0.1 --port "$port" --enable-web-dashboard False \
+    >"$STATE_DIR/serena-$port.log" 2>&1 &
+  disown 2>/dev/null || true
+  i=0
+  while [ "$i" -lt 100 ]; do
+    listening "$port" && break
+    sleep 0.3
+    i=$((i + 1))
+  done
+fi
+
+flock -u 9
+exec 9>&-
+
+listening "$port" || fallback "server not ready on :$port"
+
+# 4. Bridge the agent's stdio MCP <-> the shared SSE server.
+# --log-level WARNING silences mcp-proxy's per-request INFO spam (it would
+# otherwise flood claude's MCP server stderr) while keeping warnings/errors.
+log "bridging to serena SSE :$port (project $root)"
+exec uvx mcp-proxy --log-level WARNING "http://127.0.0.1:$port/sse"

@@ -1,0 +1,5 @@
+# nothing to build; ignore editor/OS cruft
+*.bak
+*.swp
+.DS_Store
+__pycache__/

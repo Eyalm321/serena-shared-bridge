@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# serena-shared-reap — reap idle / orphaned shared serena SSE servers.
+#
+# Companion to serena-shared-bridge. The bridge starts one detached serena SSE
+# server per project (nohup, outlives agents); without reaping they accumulate.
+#
+# Discovery is process-based (scan /proc for serena SSE servers), NOT
+# registry-based, so it also catches ORPHANS — servers whose registry row was
+# lost (crash, manual edit, drift). For each discovered server:
+#   * not listening at all  -> broken/orphan, reap immediately;
+#   * listening, has an established client connection -> active, keep;
+#   * listening but idle for >= GRACE seconds (tracked across runs) -> reap.
+# A later agent for that project just re-starts it via the bridge.
+#
+# Safe against reaping a server mid-startup: the bridge holds the registry lock
+# while starting one, and this takes the same lock, so they never overlap.
+#
+# GRACE seconds via SERENA_REAP_GRACE (default 1800). Run via systemd user timer.
+set -uo pipefail
+
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/serena-shared"
+reg="$STATE_DIR/ports.tsv"
+idle="$STATE_DIR/idle-since.tsv"
+grace="${SERENA_REAP_GRACE:-1800}"
+now="$(date +%s)"
+mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
+
+exec 9>"$STATE_DIR/registry.lock" 2>/dev/null || exit 0
+flock 9 2>/dev/null || exit 0
+
+listening() { ss -ltn 2>/dev/null | grep -q "[:.]$1 "; }
+conns() { ss -tnH state established "sport = :$1" 2>/dev/null | grep -c .; }
+
+# Discover serena SSE servers from /proc (no pgrep -> no self-match): port -> pids
+declare -A port_pids=()
+for d in /proc/[0-9]*; do
+  cmd="$(tr '\0' ' ' <"$d/cmdline" 2>/dev/null)" || continue
+  case "$cmd" in
+    *"serena start-mcp-server --transport sse"*)
+      port="$(printf '%s' "$cmd" | grep -oE -- '--port [0-9]+' | grep -oE '[0-9]+' | head -1)"
+      [ -n "$port" ] || continue
+      port_pids["$port"]="${port_pids[$port]:-}${d#/proc/} "
+      ;;
+  esac
+done
+
+declare -A idle_since=()
+[ -f "$idle" ] && while IFS=$'\t' read -r k v; do [ -n "$k" ] && idle_since["$k"]="$v"; done <"$idle"
+
+declare -A reaped=()
+newidle=""
+for port in "${!port_pids[@]}"; do
+  pids="${port_pids[$port]}"
+  if ! listening "$port"; then
+    for pid in $pids; do kill "$pid" 2>/dev/null; done
+    echo "reap: orphan serena :$port (not listening) -> killed pids $pids"
+    reaped["$port"]=1
+    continue
+  fi
+  if [ "$(conns "$port")" -gt 0 ]; then
+    continue # active client connected
+  fi
+  since="${idle_since[$port]:-}"
+  if [ -n "$since" ] && [ "$((now - since))" -ge "$grace" ]; then
+    for pid in $pids; do kill "$pid" 2>/dev/null; done
+    echo "reap: idle serena :$port (idle $((now - since))s) -> killed pids $pids"
+    reaped["$port"]=1
+  else
+    newidle+="$port	${since:-$now}"$'\n'
+  fi
+done
+printf '%s' "$newidle" >"$idle"
+
+# Rewrite the registry to keep only rows whose server is still live and was not
+# reaped this run — drops reaped ports AND dead/drifted entries. (if/else so the
+# loop always exits 0; a trailing dropped row must not suppress the mv.)
+if [ -f "$reg" ]; then
+  tmp="$reg.tmp.$$"
+  while IFS=$'\t' read -r root rport; do
+    if [ -n "$root" ] && [ -z "${reaped[$rport]:-}" ] && listening "$rport"; then
+      printf '%s\t%s\n' "$root" "$rport"
+    fi
+  done <"$reg" >"$tmp"
+  mv "$tmp" "$reg"
+fi
+
+flock -u 9

@@ -1,0 +1,6 @@
+[Unit]
+Description=Reap idle shared serena SSE servers (serena-shared-bridge companion)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/serena-shared-reap
