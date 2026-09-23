@@ -108,5 +108,7 @@ listening "$port" || fallback "server not ready on :$port"
 # 4. Bridge the agent's stdio MCP <-> the shared SSE server.
 # --log-level WARNING silences mcp-proxy's per-request INFO spam (it would
 # otherwise flood claude's MCP server stderr) while keeping warnings/errors.
+# mcp<2: mcp-proxy 0.12.0 imports mcp.server.lowlevel.server.request_ctx,
+# which the mcp 2.x SDK removed (ImportError on startup).
 log "bridging to serena SSE :$port (project $root)"
-exec uvx mcp-proxy --log-level WARNING "http://127.0.0.1:$port/sse"
+exec uvx --with "mcp<2" mcp-proxy --log-level WARNING "http://127.0.0.1:$port/sse"
